@@ -1,0 +1,99 @@
+# ============================================================
+#  teamchat-v2-syncEngine — root .gitignore
+# ============================================================
+
+# ---------------------------
+# Node / npm
+# ---------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# ---------------------------
+# Environment & secrets
+# ---------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
+# ---------------------------
+# Build output
+# ---------------------------
+dist/
+build/
+out/
+.output/
+
+# ---------------------------
+# Vite / React frontend
+# ---------------------------
+frontend/dist/
+frontend/.cache/
+frontend/node_modules/
+
+# ---------------------------
+# Sync engine package
+# ---------------------------
+nde-syncengine-v3-pkg*/node_modules/
+nde-syncengine-v3-pkg*/dist/
+
+# ---------------------------
+# Logs
+# ---------------------------
+logs/
+*.log
+*.log.*
+
+# ---------------------------
+# OS artifacts
+# ---------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ---------------------------
+# IDE / editor
+# ---------------------------
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+
+# ---------------------------
+# Docker
+# ---------------------------
+docker-compose.override.yml
+
+# ---------------------------
+# Testing & coverage
+# ---------------------------
+coverage/
+.nyc_output/
+test-results/
+
+# ---------------------------
+# Misc
+# ---------------------------
+*.tgz
+*.tar.gz
+*.zip
+.cache/
+.temp/
+tmp/

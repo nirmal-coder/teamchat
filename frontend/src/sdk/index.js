@@ -1,0 +1,5 @@
+export { SyncClient }    from './SyncClient.js'
+export { EventEmitter }  from './EventEmitter.js'
+export { OutQueue }      from './OutQueue.js'
+export { IdbStore }      from './IdbStore.js'
+export { CryptoStore }   from './CryptoStore.js'
