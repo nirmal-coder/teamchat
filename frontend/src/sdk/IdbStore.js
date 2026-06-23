@@ -20,7 +20,7 @@
  * the right data from the server without re-fetching everything.
  */
 
-const DB_VERSION       = 2
+const DB_VERSION       = 5
 const RETENTION_DAYS   = 30
 const MAX_MSGS_PER_CONV = 1_000
 const MIN_MSGS_KEEP    = 50   // always keep this many recent msgs per conv
@@ -48,6 +48,20 @@ export class IdbStore {
         if (oldVersion === 1) {
           if (db.objectStoreNames.contains('messages'))     db.deleteObjectStore('messages')
           if (db.objectStoreNames.contains('conversations')) db.deleteObjectStore('conversations')
+        }
+        // v2 → v3: clear messages that had payload stored as "[object Object]" (CBOR Binary bug fix)
+        if (oldVersion === 2) {
+          if (db.objectStoreNames.contains('messages')) db.deleteObjectStore('messages')
+        }
+        // v3 → v4: clear orphaned negative-seq pending messages
+        if (oldVersion === 3) {
+          if (db.objectStoreNames.contains('messages')) db.deleteObjectStore('messages')
+        }
+        // v4 → v5: v4 cleared messages but not cursors, leaving stale cursors that tell the
+        // server "client already has seq N" even though IDB is empty. Clear cursors so the
+        // server resends all messages on next HELLO.
+        if (oldVersion === 4) {
+          if (db.objectStoreNames.contains('cursors')) db.deleteObjectStore('cursors')
         }
 
         if (!db.objectStoreNames.contains('messages')) {

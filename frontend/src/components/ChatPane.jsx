@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState, useMemo } from 'react'
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react'
 import { useStore } from '../store/index.js'
 import { useUsers } from '../hooks/useUsers.js'
 import { useNdeMessages } from '../hooks/useNdeMessages.js'
 import { useNdeConversation } from '../hooks/useNdeConversation.js'
 import { useNdeSendMessage } from '../hooks/useNdeSendMessage.js'
 import { useNdeGroupActions } from '../hooks/useNdeGroupActions.js'
+import { useNdeClient } from '../hooks/useNdeClient.js'
 import MessageBubble from './MessageBubble.jsx'
 import TypingIndicator from './TypingIndicator.jsx'
 import Composer from './Composer.jsx'
@@ -12,6 +13,7 @@ import Composer from './Composer.jsx'
 export default function ChatPane() {
   const activeConvId = useStore(s => s.activeConvId)
   const userId       = useStore(s => s.userId)
+  const client       = useNdeClient()
   const conv         = useNdeConversation(activeConvId)
   const allUsers     = useUsers()
   const userMap      = useMemo(() => new Map(allUsers.map(u => [u.userId, u.username])), [allUsers])
@@ -26,19 +28,73 @@ export default function ChatPane() {
   }, [conv, activeConvId, userId, userMap])
   const messages     = useNdeMessages(activeConvId)
   const { sendRead } = useNdeSendMessage(activeConvId)
-  const bottomRef    = useRef()
+  const bottomRef      = useRef()
+  const scrollRef      = useRef()
+  const isLoadingMore  = useRef(false)
+  const hasMore        = useRef(true)
+  const messagesRef    = useRef(messages)
+  messagesRef.current  = messages
+  const [loadingMore, setLoadingMore] = useState(false)
   const [replyTo, setReplyTo]   = useState(null)
   const [showInfo, setShowInfo] = useState(false)
 
+  // Auto-scroll to bottom when a new message arrives.
+  // Always scroll for own messages (just sent). Skip only when loading older history.
+  const lastMsg = messages[messages.length - 1]
+  const lastMsgUlid = lastMsg?.ulid
   useEffect(() => {
+    const isOwnMsg = lastMsg?.senderId === userId
+    if (isLoadingMore.current && !isOwnMsg) return
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages.length])
+  }, [lastMsgUlid]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!activeConvId || !messages.length) return
-    const last = messages[messages.length - 1]
-    if (last && last.seq > 0) sendRead(last.seq)
+    // Only send read for real server messages, not pending (pending seq ≈ Date.now() >> 1e12)
+    const lastReal = [...messages].reverse().find(m => m.status !== 'pending' && m.seq > 0)
+    if (lastReal) sendRead(lastReal.seq)
   }, [activeConvId, messages.length])
+
+  // Reset pagination state when switching conversations
+  useEffect(() => {
+    hasMore.current = true
+    isLoadingMore.current = false
+    setLoadingMore(false)
+  }, [activeConvId])
+
+  const handleScroll = useCallback(async () => {
+    const el = scrollRef.current
+    if (!el || isLoadingMore.current || !hasMore.current) return
+    if (el.scrollTop > 100) return
+
+    const msgs = messagesRef.current
+    const oldest = msgs.find(m => m.status !== 'pending' && m.seq > 0)
+    if (!oldest) return
+
+    isLoadingMore.current = true
+    setLoadingMore(true)
+    const prevScrollHeight = el.scrollHeight
+
+    const loaded = await client.loadMoreMessages(activeConvId, oldest.seq, 50)
+
+    if (loaded === 0) hasMore.current = false
+
+    // Restore scroll position so the viewport doesn't jump
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight - prevScrollHeight
+      }
+      isLoadingMore.current = false
+      setLoadingMore(false)
+    })
+  }, [activeConvId, client])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [handleScroll])
 
   if (!activeConvId) {
     return (
@@ -81,13 +137,19 @@ export default function ChatPane() {
       )}
 
       <div className="flex flex-1 overflow-hidden">
-        <div className="flex-1 overflow-y-auto py-2" id="messages-scroll">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto py-2" id="messages-scroll">
+          {loadingMore && (
+            <div className="flex justify-center py-3">
+              <span className="text-xs text-gray-500">Loading older messages…</span>
+            </div>
+          )}
           {messages.length === 0 && (
             <div className="text-center text-gray-600 text-sm mt-16">No messages yet</div>
           )}
           {messages.map((msg) => (
             <MessageBubble key={msg.ulid ?? msg.seq} msg={msg} convId={activeConvId}
               senderName={userMap.get(msg.senderId) ?? msg.senderId?.slice(0, 8)}
+              userMap={userMap}
               onReplySelect={setReplyTo} />
           ))}
           <TypingIndicator convId={activeConvId} />

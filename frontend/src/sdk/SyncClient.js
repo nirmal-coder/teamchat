@@ -23,6 +23,15 @@ function payloadToText(p) {
 const _EMPTY_ARRAY = Object.freeze([])
 const _EMPTY_MAP   = Object.freeze(new Map())
 
+// Sort conversations: most recent activity first.
+// Uses lastMsg.ts (covers pending messages whose pendingSeq >> any real seq),
+// falls back to lastSeq (cursor), then createdAt for brand-new empty convs.
+function _sortConvs(a, b) {
+  const ta = a.lastMsg?.ts ?? a.lastSeq ?? a.createdAt ?? 0
+  const tb = b.lastMsg?.ts ?? b.lastSeq ?? b.createdAt ?? 0
+  return tb - ta
+}
+
 /**
  * SyncClient — framework-agnostic, event-driven sync engine client.
  *
@@ -91,8 +100,9 @@ export class SyncClient extends EventEmitter {
     // Conv preferences: Map<convId, PrefDoc>
     this._prefs = new Map()
 
-    this._outQueue = new OutQueue({ maxSize: outMaxSize, ttlMs: outTtlMs })
-    this._idb      = useIdb ? new IdbStore(idbName) : null
+    this._outQueue    = new OutQueue({ maxSize: outMaxSize, ttlMs: outTtlMs })
+    this._idb         = useIdb ? new IdbStore(idbName) : null
+    this._pendingSeq  = 0   // initialized lazily to Date.now() on first send
 
     // Typing debounce + cleanup timers
     this._typingTimer   = null
@@ -176,10 +186,7 @@ export class SyncClient extends EventEmitter {
   getUnread(convId) {
     const conv = this.conversations.get(convId)
     if (!conv) return 0
-    const cursor = conv.lastReadSeq ?? 0
-    return (this._msgArrays.get(convId) ?? [])
-      .filter(m => m.seq > cursor && m.seq > 0 && m.senderId !== this.userId)
-      .length
+    return Math.max(0, (conv.lastSeq ?? 0) - (conv.lastReadSeq ?? 0))
   }
 
   // ── IDB bootstrap ─────────────────────────────────────────────────────────
@@ -196,12 +203,25 @@ export class SyncClient extends EventEmitter {
     }
     await Promise.all(convs.map(async (conv) => {
       const msgs = await this._idb.getMessages(conv.convId, 0)
-      for (const msg of msgs) this._insertMsg(conv.convId, msg, false)
+      for (const msg of msgs) {
+        this._insertMsg(conv.convId, msg, false)
+        // Re-queue pending TEXT messages so they're retransmitted on next WS connect.
+        // Their SEND frame is reconstructed from IDB-stored content.
+        if (msg.status === 'pending' && msg.contentType === CT.TEXT && msg.payload) {
+          const buf = mkSend(msg.ulid, conv.convId, CT.TEXT, textEnc.encode(msg.payload),
+                             msg.replyTo ?? null, msg.ttl ?? 0)
+          this._outQueue.push(msg.ulid, buf, msg.ts)
+        }
+      }
     }))
     for (const pref of allPrefs) this._prefs.set(pref.convId, pref)
     // Rebuild stable arrays once (avoid per-insert overhead during bulk load)
     this._rebuildConvArray()
     if (this.conversations.size > 0) this.emit('conv:list')
+    // Race fix: if WS opened before IDB finished loading, drain pending messages now
+    if (this._wsStatus === 'open') {
+      this._outQueue.drain((buf) => this._wsc.send(buf))
+    }
   }
 
   // ── WS callbacks ─────────────────────────────────────────────────────────
@@ -259,6 +279,11 @@ export class SyncClient extends EventEmitter {
         // handles the -T → realSeq promotion cleanly inside _insertMsg.
         this._patchByUlid(convId, ulid_, { ts: serverTs, status: 'sent' })
         this._upsertConv(convId, { lastSeq: seq })
+        // Own message: advance read cursor so unread count stays 0 for the sender
+        const ackConv = this.conversations.get(convId)
+        if ((ackConv?.lastReadSeq ?? 0) < seq) {
+          this._upsertConv(convId, { lastReadSeq: seq })
+        }
         this.emit(`conv:${convId}`)
         this.emit('conv:list')
         // Remove any pending gap reqs for this conv
@@ -271,10 +296,17 @@ export class SyncClient extends EventEmitter {
       case T.MSG: {
         const [convId, seq, ulid_, senderId, contentType, payload, ts, meta] = fields
         const text = contentType === CT.POLL ? null : payloadToText(payload)
+        // Own messages: carry status set by ACK on the optimistic entry.
+        // Default 'sent' so sender always has a visible tick even if ACK hasn't arrived.
+        let status = 'received'
+        if (senderId === this.userId) {
+          const existing = this.getMessage(convId, ulid_)
+          status = existing?.status ?? 'sent'
+        }
         const msg = {
           ulid: ulid_, seq, senderId, contentType,
           payload: text, rawPayload: payload, ts, meta,
-          status: 'received', reactions: {},
+          status, reactions: {},
           replyTo: meta?.replyTo ?? null, fwd: meta?.fwd ?? 0, ttl: meta?.ttl ?? 0,
           edited: false, deleted: false, expired: false,
         }
@@ -285,16 +317,18 @@ export class SyncClient extends EventEmitter {
         this._upsertConv(convId, { lastSeq: seq })
         this.emit(`conv:${convId}`)
         this.emit('conv:list')
-        // Debounced DELIVERED (flush to OutQueue if WS closes before timer fires)
-        this._deliveredSeqs[convId] = Math.max(this._deliveredSeqs[convId] || 0, seq)
-        clearTimeout(this._deliveredTimers[convId])
-        this._deliveredTimers[convId] = setTimeout(() => {
-          if (this._wsStatus === 'open') {
-            this._wsc.send(mkDelivered(convId, this._deliveredSeqs[convId]))
-          }
-          delete this._deliveredTimers[convId]
-          delete this._deliveredSeqs[convId]
-        }, 400)
+        // Debounced DELIVERED — skip own messages to avoid spurious receipt loops
+        if (senderId !== this.userId) {
+          this._deliveredSeqs[convId] = Math.max(this._deliveredSeqs[convId] || 0, seq)
+          clearTimeout(this._deliveredTimers[convId])
+          this._deliveredTimers[convId] = setTimeout(() => {
+            if (this._wsStatus === 'open') {
+              this._wsc.send(mkDelivered(convId, this._deliveredSeqs[convId]))
+            }
+            delete this._deliveredTimers[convId]
+            delete this._deliveredSeqs[convId]
+          }, 400)
+        }
         break
       }
 
@@ -325,19 +359,63 @@ export class SyncClient extends EventEmitter {
       }
 
       case T.RECEIPT: {
-        const [convId, seq, , kind] = fields
-        const msg = this.getMessageBySeq(convId, seq)
-        if (msg?.senderId === this.userId) {
-          this._patchMsg(convId, seq, { status: kind === 2 ? 'read' : 'delivered' })
-          this.emit(`msgstatus:${convId}:${msg.ulid}`)
+        const [convId, seq, receiptUserId, kind] = fields
+
+        // Cross-device: WE read on another device — only sync unread cursor, never touch status
+        if (receiptUserId === this.userId) {
+          if (kind === 2) {
+            const c = this.conversations.get(convId)
+            if ((c?.lastReadSeq ?? 0) < seq) {
+              this._upsertConv(convId, { lastReadSeq: seq })
+              this.emit(`conv:${convId}`)
+              this.emit('conv:list')
+            }
+          }
+          break
+        }
+
+        // Group convs: RECEIPT_AGG drives status; T.RECEIPT is noise here
+        const rConv = this.conversations.get(convId)
+        if ((rConv?.members?.length ?? 0) > 2) break
+
+        // DM — the other party read/delivered our messages: cursor walk up to seq
+        const newStatus = kind === 2 ? 'read' : 'delivered'
+        const STATUS_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 }
+        const rcptArr = this._msgArrays.get(convId) ?? []
+        for (const m of rcptArr) {
+          if (m.seq > seq) break
+          if (m.senderId !== this.userId) continue
+          if ((STATUS_RANK[m.status] ?? 0) >= STATUS_RANK[newStatus]) continue
+          this._patchMsg(convId, m.seq, { status: newStatus })
+          this.emit(`msgstatus:${convId}:${m.ulid}`)
         }
         break
       }
 
       case T.RECEIPT_AGG: {
         const [convId, seq, deliveredCount, readCount, total] = fields
-        const msg = this.getMessageBySeq(convId, seq)
-        if (msg) {
+        const STATUS_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 }
+        // all other members = total - 1 (total includes sender)
+        const threshold = total - 1
+        const newStatus = readCount >= threshold ? 'read'
+                        : deliveredCount >= threshold ? 'delivered'
+                        : null
+
+        if (newStatus) {
+          // Threshold met: READ is a cursor — walk all own messages up to seq
+          const aggArr = this._msgArrays.get(convId) ?? []
+          for (const m of aggArr) {
+            if (m.seq > seq) break
+            if (m.senderId !== this.userId) continue
+            if ((STATUS_RANK[m.status] ?? 0) >= STATUS_RANK[newStatus]) continue
+            this._patchMsg(convId, m.seq, { status: newStatus })
+            this.emit(`msgstatus:${convId}:${m.ulid}`)
+          }
+        }
+
+        // Always store aggregate counts on the specific message
+        const aggMsg = this.getMessageBySeq(convId, seq)
+        if (aggMsg?.senderId === this.userId) {
           this._patchMsg(convId, seq, { receiptAgg: { delivered: deliveredCount, read: readCount, total } })
           this.emit(`receipts:${convId}:${seq}`)
         }
@@ -469,17 +547,11 @@ export class SyncClient extends EventEmitter {
       }
 
       case T.SYNC_GAP: {
-        const [convId, fromSeq, , useRest] = fields
-        console.warn(`[SyncClient] SYNC_GAP in ${convId} from seq ${fromSeq}`)
-        if (!useRest) {
-          const key = `${convId}:${fromSeq}`
-          if (!this._pendingGapReqs.has(key)) {
-            this._pendingGapReqs.add(key)
-            this._wsc.send(mkSyncReq(convId, fromSeq))
-            // Allow retry after 30 s in case the server response was lost
-            setTimeout(() => this._pendingGapReqs.delete(key), 30_000)
-          }
-        }
+        const [convId, fromSeq, toSeq] = fields
+        console.warn(`[SyncClient] SYNC_GAP ${convId} gap=${toSeq - fromSeq}`)
+        this._fetchGapViaHttp(convId, fromSeq).catch(err =>
+          console.error('[SyncClient] gap fetch failed:', err)
+        )
         break
       }
 
@@ -518,21 +590,19 @@ export class SyncClient extends EventEmitter {
     if (idx !== -1) {
       const next = [...this._convArray]
       next[idx] = updated
-      if (patch.lastSeq !== undefined || patch.lastMsg !== undefined) {
-        next.sort((a, b) => (b.lastSeq ?? 0) - (a.lastSeq ?? 0))
+      if (patch.lastSeq !== undefined || patch.lastMsg !== undefined || patch.createdAt !== undefined) {
+        next.sort(_sortConvs)
       }
       this._convArray = next
     } else {
-      this._convArray = [...this._convArray, updated]
-        .sort((a, b) => (b.lastSeq ?? 0) - (a.lastSeq ?? 0))
+      this._convArray = [...this._convArray, updated].sort(_sortConvs)
     }
 
     if (persist && this._idb) this._idb.putConversation(updated).catch(() => {})
   }
 
   _rebuildConvArray() {
-    this._convArray = [...this.conversations.values()]
-      .sort((a, b) => (b.lastSeq ?? 0) - (a.lastSeq ?? 0))
+    this._convArray = [...this.conversations.values()].sort(_sortConvs)
   }
 
   /**
@@ -569,7 +639,11 @@ export class SyncClient extends EventEmitter {
     }
     const msgMap = this._msgs.get(convId)
     const uidx   = this._ulidIdx.get(convId)
-    const arr    = this._msgArrays.get(convId)
+    const existing = this._msgArrays.get(convId)
+
+    // notify=true (live update): work on a copy so useSyncExternalStore gets a new reference.
+    // notify=false (bulk IDB load): mutate in-place for O(n log n) rather than O(n²).
+    const arr = notify ? [...existing] : existing
 
     // Optimistic → confirmed: remove old seq entry
     if (msg.ulid) {
@@ -578,12 +652,25 @@ export class SyncClient extends EventEmitter {
         msgMap.delete(oldSeq)
         const oldIdx = this._binaryFind(arr, oldSeq)
         if (oldIdx !== -1) arr.splice(oldIdx, 1)
+        // If the promoted message was conv.lastMsg (pending seq is large, real seq is small,
+        // so the normal lastMsg update below won't fire), force-update with the real seq now.
+        const promoConv = this.conversations.get(convId)
+        if (promoConv?.lastMsg?.ulid === msg.ulid) {
+          this._upsertConv(convId, {
+            lastMsg: {
+              ulid: msg.ulid, seq: msg.seq, senderId: msg.senderId,
+              contentType: msg.contentType, payload: msg.payload,
+              ts: msg.ts, deleted: false, expired: false,
+            }
+          })
+        }
       }
     }
 
     msgMap.set(msg.seq, msg)
     if (msg.ulid) uidx.set(msg.ulid, msg.seq)
     this._binaryInsert(arr, msg)   // O(log n) insertion, no full sort
+    if (notify) this._msgArrays.set(convId, arr)
 
     // Denormalize lastMsg into conv (real messages only)
     if (msg.seq > 0) {
@@ -615,11 +702,16 @@ export class SyncClient extends EventEmitter {
     const updated = { ...msg, ...patch }
     map.set(seq, updated)
 
-    // Update in-place — seq unchanged so array position is unchanged
+    // Always create a NEW array reference — mutating in-place keeps the same reference,
+    // so useSyncExternalStore's Object.is comparison sees no change and skips re-render.
     const arr = this._msgArrays.get(convId)
     if (arr) {
       const idx = this._binaryFind(arr, seq)
-      if (idx !== -1) arr[idx] = updated
+      if (idx !== -1) {
+        const next = [...arr]
+        next[idx] = updated
+        this._msgArrays.set(convId, next)
+      }
     }
 
     // Keep lastMsg in conv in sync
@@ -664,8 +756,13 @@ export class SyncClient extends EventEmitter {
     }
     const id  = ulid()
     const buf = mkSend(id, convId, CT.TEXT, encoded, replyTo, ttl)
+    // Pending seq: large positive so it (1) sorts to END of chat, (2) is loadable by
+    // getMessages(convId, 0). Real server seqs start at 1 and grow slowly — they will
+    // never reach Date.now() (~1.75e12) in practice.
+    if (!this._pendingSeq) this._pendingSeq = Date.now()
+    const pendingSeq = this._pendingSeq++
     this._insertMsg(convId, {
-      ulid: id, seq: -Date.now(), senderId: this.userId, contentType: CT.TEXT,
+      ulid: id, seq: pendingSeq, senderId: this.userId, contentType: CT.TEXT,
       payload: text, ts: Date.now(), status: 'pending',
       reactions: {}, edited: false, deleted: false, expired: false,
       replyTo, fwd: 0, ttl,
@@ -704,6 +801,8 @@ export class SyncClient extends EventEmitter {
     this._wsc.send(mkRead(convId, seq))
     this._upsertConv(convId, { lastReadSeq: seq })
     if (this._idb) this._idb.setCursor(convId, seq).catch(() => {})
+    this.emit(`conv:${convId}`)
+    this.emit('conv:list')
   }
 
   editMessage(convId, targetUlid, newText) {
@@ -771,7 +870,7 @@ export class SyncClient extends EventEmitter {
   }
 
   joinConv(convId, members = [], subject = null) {
-    this._upsertConv(convId, { members, lastSeq: 0, ...(subject ? { subject } : {}) })
+    this._upsertConv(convId, { members, lastSeq: 0, createdAt: Date.now(), ...(subject ? { subject } : {}) })
     this._createdConvs.add(convId)
     this.emit('conv:list')
     if (this._welcomed) {
@@ -818,6 +917,10 @@ export class SyncClient extends EventEmitter {
       const msgs = await this._idb.getMessagesBefore(convId, beforeSeq, limit).catch(() => [])
       if (msgs.length > 0) {
         for (const msg of msgs) this._insertMsg(convId, msg, false)
+        // Bulk inserts use notify=false (in-place mutation, same array ref).
+        // Force a NEW array reference so useSyncExternalStore detects the change.
+        const arr = this._msgArrays.get(convId)
+        if (arr) this._msgArrays.set(convId, [...arr])
         this.emit(`msg:list:${convId}`)
         return msgs.length
       }
@@ -826,6 +929,56 @@ export class SyncClient extends EventEmitter {
     const fromSeq = Math.max(0, (beforeSeq ?? 0) - limit)
     this._wsc.send(mkSyncReq(convId, fromSeq))
     return 0
+  }
+
+  // ── HTTP gap fetch ────────────────────────────────────────────────────────
+
+  async _fetchGapViaHttp(convId, fromSeq) {
+    if (!this._httpUrl) return
+    const token = await this._getToken()
+    if (!token) return
+    let cursor  = fromSeq
+    let hasMore = true
+
+    while (hasMore) {
+      const url = `${this._httpUrl}/conversations/${encodeURIComponent(convId)}/messages?from=${cursor}&limit=100`
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+
+      for (const m of data.messages) {
+        const payloadBuf = m.payload
+          ? Uint8Array.from(atob(m.payload), c => c.charCodeAt(0))
+          : null
+        const msg = {
+          ulid:        m.ulid,
+          seq:         m.seq,
+          senderId:    m.senderId,
+          contentType: m.contentType,
+          payload:     payloadToText(payloadBuf),
+          rawPayload:  payloadBuf,
+          ts:          m.ts,
+          status:      m.senderId === this.userId ? 'sent' : 'received',
+          reactions:   m.reactions ?? {},
+          replyTo:     m.meta?.replyTo ?? null,
+          fwd:         m.meta?.fwd     ?? 0,
+          ttl:         m.meta?.ttl     ?? 0,
+          edited:      !!m.meta?.edited,
+          deleted:     !!m.deleted,
+          expired:     !!m.expired,
+        }
+        this._insertMsg(convId, msg, false)
+      }
+
+      // Force new array reference so useSyncExternalStore re-renders
+      const arr = this._msgArrays.get(convId)
+      if (arr) this._msgArrays.set(convId, [...arr])
+      this.emit(`msg:list:${convId}`)
+
+      hasMore = data.hasMore
+      if (!data.messages.length) break
+      cursor = data.messages[data.messages.length - 1].seq
+    }
   }
 
   // ── Search ────────────────────────────────────────────────────────────────

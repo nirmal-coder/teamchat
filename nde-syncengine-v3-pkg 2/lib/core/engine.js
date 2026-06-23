@@ -8,8 +8,20 @@
 const F = require('../common/frames');
 const { ensure, requireMember, requireTarget } = require('../common/errors');
 
-const LIVE_MAX = 500;
+const LIVE_MAX = 100;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
+
+// Normalize payload from MongoDB/Redis cache back to a plain Buffer for CBOR encoding.
+// MongoDB returns bson.Binary; Redis cache stores JSON.stringify'd Buffer as {type,data}.
+// Both must be converted to Uint8Array/Buffer before CBOR encodes the MSG frame.
+function normalizePayload(p) {
+  if (!p || p instanceof Uint8Array) return p                         // already correct
+  if (p.buffer instanceof Uint8Array)                                 // bson.Binary
+    return p.buffer.slice(0, p.position ?? p.buffer.length)
+  if (p.type === 'Buffer' && Array.isArray(p.data))                   // JSON.parse'd Buffer
+    return Buffer.from(p.data)
+  return p
+}
 const DELETE_WINDOW_MS = 2 * 24 * 60 * 60 * 1000 + 12 * 60 * 60 * 1000;
 const FWD_LIMIT = 5;
 
@@ -49,7 +61,7 @@ class CoreEngine {
         else {
           const meta = (m.edited || m.replyTo || m.ttl || m.fwd)
             ? { edited: !!m.edited, replyTo: m.replyTo || null, ttl: m.ttl || 0, fwd: m.fwd || 0 } : null;
-          session.send(F.msg(convId, m.seq, m._id, m.senderId, m.contentType, m.payload, m.ts, meta));
+          session.send(F.msg(convId, m.seq, m._id, m.senderId, m.contentType, normalizePayload(m.payload), m.ts, meta));
         }
         cursor = Math.max(cursor, m.seq, m.editSeq || 0, m.deleteSeq || 0, m.expireSeq || 0, m.pinSeq || 0);
       }

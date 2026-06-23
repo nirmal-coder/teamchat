@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { useStore } from '../store/index.js'
 import { useNdeConversations } from '../hooks/useNdeConversations.js'
 import { useNdeStatus } from '../hooks/useNdeStatus.js'
+import { useNdeUnread } from '../hooks/useNdeUnread.js'
 import { useUsers } from '../hooks/useUsers.js'
 import { Dot } from './PresenceDot.jsx'
 import NewChatModal from './NewChatModal.jsx'
@@ -54,39 +55,16 @@ export default function Sidebar() {
             Start a conversation using "New Chat"
           </div>
         )}
-        {conversations.map((conv) => {
-          const lastMsg  = conv.lastMsg
-          const isActive = conv.convId === activeConvId
-          const otherMemberId = conv.convId.startsWith('dm:')
-            ? conv.members?.find(m => m !== userId)
-            : null
-          const displayName = conv.subject
-            ?? (otherMemberId ? (userMap.get(otherMemberId) ?? otherMemberId.slice(0, 8)) : conv.convId)
-          return (
-            <button key={conv.convId} onClick={() => setActiveConv(conv.convId)}
-              className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors ${isActive ? 'bg-[#2a3942]' : 'hover:bg-[#182229]'}`}>
-              <div className="w-10 h-10 rounded-full bg-[#2a3942] flex items-center justify-center text-sm font-bold flex-shrink-0">
-                {conv.convId.startsWith('dm:') ? '👤' : (conv.subject?.[0]?.toUpperCase() ?? '#')}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex justify-between items-baseline">
-                  <span className="text-sm font-medium truncate">{displayName}</span>
-                  {lastMsg && <span className="text-xs text-gray-500 flex-shrink-0 ml-2">
-                    {new Date(lastMsg.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </span>}
-                </div>
-                <div className="text-xs text-gray-500 truncate">
-                  {lastMsg
-                    ? (lastMsg.deleted ? 'Deleted message'
-                      : lastMsg.expired ? 'Expired message'
-                      : lastMsg.contentType === 8 ? '📊 Poll'
-                      : lastMsg.payload?.slice(0, 50) ?? '…')
-                    : 'No messages'}
-                </div>
-              </div>
-            </button>
-          )
-        })}
+        {conversations.map((conv) => (
+          <ConvRow
+            key={conv.convId}
+            conv={conv}
+            userId={userId}
+            userMap={userMap}
+            isActive={conv.convId === activeConvId}
+            onSelect={setActiveConv}
+          />
+        ))}
       </div>
 
       {/* Toasts */}
@@ -100,5 +78,51 @@ export default function Sidebar() {
 
       {showNewChat && <NewChatModal onClose={() => setShowNewChat(false)} />}
     </div>
+  )
+}
+
+function ConvRow({ conv, userId, userMap, isActive, onSelect }) {
+  const unread = useNdeUnread(conv.convId)
+  const lastMsg = conv.lastMsg
+  const otherMemberId = conv.convId.startsWith('dm:')
+    ? conv.members?.find(m => m !== userId)
+    : null
+  const displayName = conv.subject
+    ?? (otherMemberId ? (userMap.get(otherMemberId) ?? otherMemberId.slice(0, 8)) : conv.convId)
+
+  return (
+    <button onClick={() => onSelect(conv.convId)}
+      className={`w-full flex items-center gap-3 px-4 py-3 text-left transition-colors ${isActive ? 'bg-[#2a3942]' : 'hover:bg-[#182229]'}`}>
+      <div className="relative w-10 h-10 flex-shrink-0">
+        <div className="w-10 h-10 rounded-full bg-[#2a3942] flex items-center justify-center text-sm font-bold">
+          {conv.convId.startsWith('dm:') ? '👤' : (conv.subject?.[0]?.toUpperCase() ?? '#')}
+        </div>
+        {unread > 0 && !isActive && (
+          <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-green-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">
+            {unread > 99 ? '99+' : unread}
+          </span>
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex justify-between items-baseline">
+          <span className={`text-sm truncate ${unread > 0 && !isActive ? 'font-semibold text-white' : 'font-medium'}`}>
+            {displayName}
+          </span>
+          {lastMsg && (
+            <span className="text-xs text-gray-500 flex-shrink-0 ml-2">
+              {new Date(lastMsg.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          )}
+        </div>
+        <div className={`text-xs truncate ${unread > 0 && !isActive ? 'text-gray-300' : 'text-gray-500'}`}>
+          {lastMsg
+            ? (lastMsg.deleted ? 'Deleted message'
+              : lastMsg.expired ? 'Expired message'
+              : lastMsg.contentType === 8 ? '📊 Poll'
+              : lastMsg.payload?.slice(0, 50) ?? '…')
+            : 'No messages'}
+        </div>
+      </div>
+    </button>
   )
 }

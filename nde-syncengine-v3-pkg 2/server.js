@@ -39,7 +39,11 @@ function apiErr(res, e) {
 async function bearerAuth(req, users) {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ')) throw Object.assign(new Error('unauthorized'), { status: 401 });
-  return users.verify(h.slice(7));
+  try {
+    return await users.verify(h.slice(7));
+  } catch {
+    throw Object.assign(new Error('invalid or expired token'), { status: 401 });
+  }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -154,6 +158,63 @@ async function main() {
       send(res, 200, { convId, subject, members: memberDetails });
     } catch (e) { apiErr(res, e); }
   });
+
+  // Serialize a MongoDB message doc to a JSON-safe shape for the HTTP gap endpoint
+  function serializeMsg(m) {
+    const raw = m.payload
+    let b64 = null
+    if (raw) {
+      // MongoDB returns bson.Binary; Redis cache returns a plain Buffer or {type,data}
+      const buf = Buffer.isBuffer(raw) ? raw
+        : raw?.buffer ? Buffer.from(raw.buffer) : Buffer.from(raw)
+      b64 = buf.toString('base64')
+    }
+    return {
+      ulid:        m._id,
+      seq:         m.seq,
+      senderId:    m.senderId,
+      contentType: m.contentType,
+      payload:     b64,
+      ts:          m.ts,
+      deleted:     !!m.deleted,
+      expired:     !!m.expired,
+      reactions:   m.reactions ?? {},
+      meta: {
+        replyTo: m.replyTo ?? null,
+        ttl:     m.ttl     ?? 0,
+        fwd:     m.fwd     ?? 0,
+        edited:  !!m.edited,
+      },
+    }
+  }
+
+  // GET /conversations/:convId/messages?from=0&limit=100
+  // Called by the client when SYNC_GAP is received (gap > LIVE_MAX).
+  app.get('/conversations/:convId/messages', async (req, res) => {
+    try {
+      const { userId } = await bearerAuth(req, users)
+      const { convId } = req.params
+      const fromSeq = Math.max(0, Number(req.query.from ?? 0))
+      const limit   = Math.min(Math.max(1, Number(req.query.limit ?? 100)), 200)
+
+      if (!(await storage.isMember(convId, userId)))
+        throw Object.assign(new Error('not a member'), { status: 403 })
+
+      // Redis cache first (hot), fall back to MongoDB
+      let msgs = typeof storage.rangeFromCache === 'function'
+        ? await storage.rangeFromCache(convId, fromSeq, limit) : []
+      if (msgs.length === 0)
+        msgs = await storage.range(convId, fromSeq, limit)
+
+      const maxSeq = Number(await redis.get(`conv:${convId}:seq`)) || 0
+
+      send(res, 200, {
+        messages: msgs.map(serializeMsg),
+        maxSeq,
+        hasMore: msgs.length === limit,
+      })
+    } catch (e) { apiErr(res, e) }
+  })
 
   app.listen(PORT_HTTP, () => {
     console.log('');

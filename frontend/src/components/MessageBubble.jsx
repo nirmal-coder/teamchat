@@ -1,16 +1,17 @@
 import { useState, useRef, useEffect } from 'react'
 import { useStore } from '../store/index.js'
 import { useNdeMessageActions } from '../hooks/useNdeMessageActions.js'
+import { useNdeClient } from '../hooks/useNdeClient.js'
 import { CT } from '../ws/frames.js'
 import PollCard from './PollCard.jsx'
 
 const COMMON_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
 
 function StatusTick({ status }) {
-  if (status === 'pending')   return <span className="text-gray-500 text-xs">●</span>
+  if (status === 'pending')   return <span className="text-gray-600 text-xs">●</span>
   if (status === 'sent')      return <span className="text-gray-400 text-xs">✓</span>
-  if (status === 'delivered') return <span className="text-blue-400 text-xs">✓✓</span>
-  if (status === 'read')      return <span className="text-blue-400 text-xs font-bold">✓✓</span>
+  if (status === 'delivered') return <span className="text-gray-400 text-xs">✓✓</span>
+  if (status === 'read')      return <span className="text-blue-400 text-xs">✓✓</span>
   return null
 }
 
@@ -32,9 +33,11 @@ function ReactionBar({ reactions, onToggle }) {
   )
 }
 
-export default function MessageBubble({ msg, convId, senderName, onReplySelect }) {
+export default function MessageBubble({ msg, convId, senderName, userMap, onReplySelect }) {
   const userId = useStore(s => s.userId)
+  const client = useNdeClient()
   const { editMessage, deleteMessage, toggleReact, pinMessage, consumeViewOnce } = useNdeMessageActions(convId)
+  const replyMsg = msg.replyTo ? client.getMessage(convId, msg.replyTo) : null
   const isMine = msg.senderId === userId
   const [showMenu, setShowMenu]           = useState(false)
   const [editing, setEditing]             = useState(false)
@@ -107,7 +110,26 @@ export default function MessageBubble({ msg, convId, senderName, onReplySelect }
     return (
       <div className="text-sm whitespace-pre-wrap break-words">
         {msg.fwd > 0 && <span className="text-xs text-gray-400 block mb-0.5">↪ Forwarded</span>}
-        {msg.replyTo && <div className="border-l-2 border-green-500 pl-2 mb-1 text-xs text-gray-400 italic">[reply to {msg.replyTo.slice(0, 8)}…]</div>}
+        {msg.replyTo && (
+          <div className="border-l-2 border-green-500 pl-2 mb-1 rounded-sm bg-white/5 py-1 pr-2 cursor-pointer"
+            onClick={() => onReplySelect?.(replyMsg)}>
+            <div className="text-xs font-medium text-green-400 mb-0.5">
+              {replyMsg ? (userMap?.get(replyMsg.senderId) ?? replyMsg.senderId?.slice(0, 8)) : '…'}
+            </div>
+            <div className="text-xs text-gray-400 truncate">
+              {replyMsg
+                ? (replyMsg.deleted ? '🗑 Deleted message'
+                  : replyMsg.expired ? '⏱ Expired message'
+                  : replyMsg.contentType === CT.IMAGE ? '🖼 Photo'
+                  : replyMsg.contentType === CT.VIDEO ? '🎬 Video'
+                  : replyMsg.contentType === CT.AUDIO ? '🎵 Audio'
+                  : replyMsg.contentType === CT.DOC   ? '📄 Document'
+                  : replyMsg.contentType === CT.POLL  ? '📊 Poll'
+                  : replyMsg.payload?.slice(0, 80) ?? '…')
+                : 'Message not loaded'}
+            </div>
+          </div>
+        )}
         {msg.payload}
         {msg.ttl > 0 && <span className="text-xs text-gray-500 ml-1">⏱{msg.ttl}s</span>}
         {msg.edited && <span className="text-xs text-gray-500 ml-1">(edited)</span>}
